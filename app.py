@@ -1,131 +1,294 @@
 import os
-import streamlit as st
+import tempfile
 import pandas as pd
 import plotly.express as px
+import streamlit as st
 
-from ml_engine import run_unsupervised_pipeline, FEATURE_COLS
+from ml_pipeline_v2 import run_full_ml_pipeline
+from phase2_features import build_phase2_features
 
-DEFAULT_CSV = "intellirehab_unsupervised_features.csv"
-
-st.set_page_config(page_title="SIH26113 | Movement Pattern Discovery", layout="wide")
-
-st.title("Movement Pattern Discovery for Rehabilitation & Ergonomics")
-st.caption("100% Unsupervised Learning Pipeline (INT396) | Real IntelliRehabDS Features")
-
-# Sidebar Hyperparameters & Data Input
-st.sidebar.header("Unsupervised Hyperparameters")
-n_clusters = st.sidebar.slider("Number of Clusters (K / Ward)", 2, 6, 3)
-eps = st.sidebar.slider("DBSCAN Epsilon (eps)", 0.3, 3.0, 1.1, 0.1)
-min_samples = st.sidebar.slider("DBSCAN Min Samples", 2, 15, 5)
-contamination = st.sidebar.slider("Isolation Forest Contamination", 0.02, 0.20, 0.07, 0.01)
-color_by = st.sidebar.selectbox(
-    "Color Projections By",
-    ["Cluster_KMeans", "Cluster_Hierarchical", "Cluster_DBSCAN", "Anomaly_Flag"],
+st.set_page_config(
+    page_title="IntelliRehabDS — Unsupervised Kinematics Studio",
+    page_icon="🦴",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-uploaded_file = st.sidebar.file_uploader("Upload Unlabeled Features CSV (Optional)", type=["csv"])
+st.markdown(
+    """
+    <style>
+        .block-container {padding-top: 1.4rem; padding-bottom: 2.2rem;}
+        div[data-testid="stMetric"] {
+            background-color: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(150, 165, 185, 0.18);
+            padding: 0.75rem 1rem;
+            border-radius: 10px;
+        }
+        .insight-card {
+            background-color: rgba(30, 136, 229, 0.08);
+            border-left: 4px solid #38bdf8;
+            padding: 0.85rem 1.1rem;
+            border-radius: 6px;
+            margin-bottom: 0.55rem;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-if uploaded_file is not None:
-    raw_df = pd.read_csv(uploaded_file)
-elif os.path.exists(DEFAULT_CSV):
-    raw_df = pd.read_csv(DEFAULT_CSV)
-else:
-    st.error(
-        f"'{DEFAULT_CSV}' nahi mila! Pehle `python feature_extractor.py` run karo "
-        "ya sidebar se features CSV upload karo."
-    )
-    st.stop()
 
-try:
-    results_df, metrics_df, elbow_df, pca_var = run_unsupervised_pipeline(
-        raw_df,
-        n_clusters=n_clusters,
-        eps=eps,
-        min_samples=min_samples,
+@st.cache_data(show_spinner="Running Phase 1–12 Unsupervised ML Pipeline...")
+def _cached_pipeline(
+    phase2_csv: str,
+    scaler_type: str,
+    prune_collinear: bool,
+    contamination: float,
+    lof_neighbors: int,
+    random_state: int,
+):
+    return run_full_ml_pipeline(
+        phase2_csv=phase2_csv,
+        scaler_type=scaler_type,
+        prune_collinear=prune_collinear,
+        collinear_threshold=0.95,
         contamination=contamination,
-    )
-except Exception as e:
-    st.error(f"Pipeline error: {e}")
-    st.stop()
-
-# Section 1: Internal Validation & Elbow Curve
-st.subheader("1. Internal Cluster Validation & Elbow Method (WCSS)")
-col1, col2 = st.columns([1.4, 1])
-
-with col1:
-    st.dataframe(metrics_df, use_container_width=True, hide_index=True)
-    st.info(
-        f"**PCA Explained Variance:** PC1 = {pca_var[0]*100:.1f}%, PC2 = {pca_var[1]*100:.1f}% "
-        f"(Total = {sum(pca_var)*100:.1f}%)"
+        lof_neighbors=lof_neighbors,
+        random_state=random_state,
     )
 
-with col2:
-    fig_elbow = px.line(
-        elbow_df,
-        x="K",
-        y="WCSS_Inertia",
-        markers=True,
-        title="Elbow Curve (WCSS vs K)",
-    )
-    fig_elbow.update_layout(height=280, margin=dict(l=20, r=20, t=40, b=20))
-    st.plotly_chart(fig_elbow, use_container_width=True)
 
-# Section 2: Dimensionality Reduction Projections
-st.subheader("2. Unsupervised Projections: UMAP vs t-SNE vs PCA")
-tab1, tab2, tab3 = st.tabs(["UMAP Projection", "t-SNE Projection", "PCA Projection"])
-hover_cols = [
-    "Rep_ID",
-    "Range_of_Motion_deg",
-    "Mean_Angular_Vel",
-    "Max_Angular_Vel",
-    "Movement_Jerk",
-    "Joint_Symmetry_Index",
-    "Rep_Variability",
-]
-
-with tab1:
-    st.plotly_chart(
-        px.scatter(results_df, x="UMAP_1", y="UMAP_2", color=color_by, hover_data=hover_cols),
-        use_container_width=True,
+def main():
+    st.title("IntelliRehabDS — Unsupervised Kinematics & Anomaly Studio")
+    st.caption(
+        "Unlabeled 3D Skeleton Motion Discovery • Multi-Model Clustering • Explainable Anomaly Ranking (INT396)"
     )
 
-with tab2:
-    st.plotly_chart(
-        px.scatter(results_df, x="TSNE_1", y="TSNE_2", color=color_by, hover_data=hover_cols),
-        use_container_width=True,
+    # --- Sidebar ---
+    with st.sidebar:
+        st.header("Pipeline Controls")
+        scaler_type = st.selectbox("Feature Scaler", options=["robust", "standard"], index=0)
+        prune_collinear = st.checkbox("Prune Redundant Features (|r| ≥ 0.95)", value=True)
+        contamination = st.slider("Anomaly Contamination", min_value=0.01, max_value=0.20, value=0.07, step=0.01)
+        lof_neighbors = st.slider("LOF Neighbors", min_value=5, max_value=50, value=20, step=5)
+        random_state = st.number_input("Random Seed", min_value=0, max_value=9999, value=42, step=1)
+
+        st.divider()
+        st.subheader("Projection & Dataset")
+        color_by = st.selectbox(
+            "Color Projections By",
+            options=[
+                "Cluster_KMeans",
+                "Cluster_GMM",
+                "Cluster_DBSCAN",
+                "Cluster_Hierarchical",
+                "Anomaly_Status",
+            ],
+            index=0,
+        )
+        uploaded_csv = st.file_uploader("Upload Kinematic CSV (Optional)", type=["csv"])
+
+    csv_to_use = "phase2_kinematic_features.csv"
+    if uploaded_csv is not None:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+        tmp.write(uploaded_csv.getvalue())
+        tmp.close()
+        csv_to_use = tmp.name
+
+    if not os.path.exists(csv_to_use):
+        if os.path.exists("phase2_kinematic_features.csv"):
+            csv_to_use = "phase2_kinematic_features.csv"
+        else:
+            with st.spinner("Extracting 3D kinematic features from skeleton data..."):
+                build_phase2_features(output_csv="phase2_kinematic_features.csv")
+            csv_to_use = "phase2_kinematic_features.csv"
+
+    bundle = _cached_pipeline(
+        phase2_csv=csv_to_use,
+        scaler_type=scaler_type,
+        prune_collinear=prune_collinear,
+        contamination=float(contamination),
+        lof_neighbors=int(lof_neighbors),
+        random_state=int(random_state),
     )
 
-with tab3:
-    st.plotly_chart(
-        px.scatter(results_df, x="PCA_1", y="PCA_2", color=color_by, hover_data=hover_cols),
-        use_container_width=True,
+    results_df = bundle["results_df"].copy()
+    scorecard_df = bundle["scorecard"].copy()
+    scree_df = bundle["scree"].copy()
+    fidelity_df = bundle["fidelity"].copy()
+    prof_summary = bundle["profile_summary"].copy()
+    prof_med = bundle["profile_median"].copy()
+    anom_top = bundle["anomalies_top"].copy()
+    anom_summ = bundle["anomaly_summary"]
+    insights = bundle["insights"]
+    tuned_params = bundle["tuned_params"]
+
+    # --- Top KPI Row ---
+    pca_2d_cum = (
+        f"{float(scree_df['Cumulative_Variance'].iloc[1]) * 100:.1f}%"
+        if len(scree_df) >= 2
+        else "N/A"
+    )
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Repetitions Analyzed", f"{len(results_df):,}")
+    k2.metric("Active 3D Features", f"{len(bundle['prep']['active_features'])}")
+    k3.metric("Consensus Anomalies (IF+LOF)", f"{anom_summ.get('consensus_flagged', 0)}")
+    k4.metric("PCA 2D Cumulative Variance", pca_2d_cum)
+
+    st.write("")
+
+    # --- Main 4-Tab Layout ---
+    tab_ov, tab_eval, tab_proj, tab_anom = st.tabs(
+        [
+            "Overview & Insights",
+            "Model Scorecard & PCA",
+            "2D Projections",
+            "Profiles & Anomalies",
+        ]
     )
 
-# Section 3: Cluster Profiles & Flagged Anomalies
-st.subheader("3. Discovered Cluster Profiles & Flagged Unusual Repetitions")
-c1, c2 = st.columns(2)
+    # TAB 1: Overview & Insights
+    with tab_ov:
+        st.subheader("Automated Data-Driven Insights (Phase 11)")
+        for line in insights:
+            st.markdown(f"<div class='insight-card'>{line}</div>", unsafe_allow_html=True)
 
-with c1:
-    st.markdown("**Cluster Feature Mean Summary**")
-    profile_df = results_df.groupby(color_by)[FEATURE_COLS].mean().round(4)
-    st.dataframe(profile_df, use_container_width=True)
+        st.subheader("Tuned Hyperparameters Summary")
+        p1, p2, p3, p4 = st.columns(4)
+        p1.info(f"**K-Means++**\n\nOptimal k = `{tuned_params['kmeans']['n_clusters']}`\n\nSil = `{tuned_params['kmeans']['silhouette']}`")
+        p2.info(f"**Hierarchical**\n\nLinkage = `{tuned_params['hierarchical']['linkage']}`\n\nSil = `{tuned_params['hierarchical']['silhouette']}`")
+        p3.info(f"**DBSCAN**\n\neps = `{tuned_params['dbscan']['eps']}` | min = `{tuned_params['dbscan']['min_samples']}`\n\nNoise = `{tuned_params['dbscan']['noise_pct']}%`")
+        p4.info(f"**GMM**\n\nComponents = `{tuned_params['gmm']['n_components']}`\n\nCov = `{tuned_params['gmm']['covariance_type']}`")
 
-with c2:
-    st.markdown("**Flagged Unusual Repetitions (Isolation Forest)**")
-    flagged_df = results_df[results_df["Anomaly_Flag"] == "Unusual / Flagged"][
-        ["Rep_ID", "Range_of_Motion_deg", "Mean_Angular_Vel", "Movement_Jerk", "Joint_Symmetry_Index"]
-    ]
-    st.dataframe(flagged_df, use_container_width=True, hide_index=True)
+    # TAB 2: Model Scorecard & PCA
+    with tab_eval:
+        c_left, c_right = st.columns([1.35, 1.0])
+        with c_left:
+            st.subheader("Comparative Clustering Scorecard")
+            st.dataframe(scorecard_df, use_container_width=True, hide_index=True)
 
-st.warning(
-    "Limitation & Clinical Note: Flagged repetitions and clusters reflect statistical movement patterns "
-    "and deviations—they do not represent an automated medical or ergonomic diagnosis."
-)
+            st.subheader("Original vs. 2D Embedding Fidelity")
+            st.dataframe(fidelity_df, use_container_width=True, hide_index=True)
 
-csv_bytes = results_df.to_csv(index=False).encode("utf-8")
-st.download_button(
-    "Download Unsupervised Results (CSV)",
-    data=csv_bytes,
-    file_name="sih26113_unsupervised_results.csv",
-    mime="text/csv",
-)
+        with c_right:
+            st.subheader("PCA Scree & Cumulative Variance")
+            fig_scree = px.bar(
+                scree_df,
+                x="PC",
+                y="Explained_Variance_Ratio",
+                text="Cumulative_Variance",
+                labels={"Explained_Variance_Ratio": "Explained Variance Ratio"},
+            )
+            fig_scree.update_traces(textposition="outside")
+            fig_scree.update_layout(height=360, margin=dict(l=10, r=10, t=25, b=10))
+            st.plotly_chart(fig_scree, use_container_width=True)
+
+    # TAB 3: 2D Projections
+    with tab_proj:
+        plot_df = results_df.copy()
+        plot_df[color_by] = plot_df[color_by].astype(str)
+        hover_cols = [c for c in ["Rep_ID", "Anomaly_Severity", "Top_Driving_Features"] if c in plot_df.columns]
+
+        sub_u, sub_t, sub_p = st.tabs(["UMAP", "t-SNE", "PCA"])
+
+        with sub_u:
+            fig_u = px.scatter(
+                plot_df,
+                x="UMAP_1",
+                y="UMAP_2",
+                color=color_by,
+                hover_data=hover_cols,
+                title=f"UMAP 2D Projection • Colored by {color_by}",
+            )
+            fig_u.update_traces(marker=dict(size=5.5, opacity=0.82))
+            fig_u.update_layout(height=450)
+            st.plotly_chart(fig_u, use_container_width=True)
+
+        with sub_t:
+            fig_t = px.scatter(
+                plot_df,
+                x="TSNE_1",
+                y="TSNE_2",
+                color=color_by,
+                hover_data=hover_cols,
+                title=f"t-SNE 2D Projection • Colored by {color_by}",
+            )
+            fig_t.update_traces(marker=dict(size=5.5, opacity=0.82))
+            fig_t.update_layout(height=450)
+            st.plotly_chart(fig_t, use_container_width=True)
+
+        with sub_p:
+            fig_p = px.scatter(
+                plot_df,
+                x="PCA_1",
+                y="PCA_2",
+                color=color_by,
+                hover_data=hover_cols,
+                title=f"PCA 2D Projection • Colored by {color_by}",
+            )
+            fig_p.update_traces(marker=dict(size=5.5, opacity=0.82))
+            fig_p.update_layout(height=450)
+            st.plotly_chart(fig_p, use_container_width=True)
+
+    # TAB 4: Profiles & Anomalies
+    with tab_anom:
+        left_p, right_a = st.columns([1.0, 1.35])
+
+        with left_p:
+            st.subheader("Cluster Characteristics (Data-Driven)")
+            if not prof_summary.empty:
+                st.dataframe(prof_summary, use_container_width=True, hide_index=True)
+
+            st.subheader("Cluster Feature Medians")
+            if not prof_med.empty:
+                st.dataframe(prof_med, use_container_width=True)
+
+        with right_a:
+            st.subheader(
+                f"Flagged Repetitions (Any: {anom_summ.get('any_flagged', 0)} | Consensus: {anom_summ.get('consensus_flagged', 0)})"
+            )
+            if not anom_top.empty:
+                selected_rep = st.selectbox(
+                    "Inspect Flagged Repetition",
+                    options=anom_top["Rep_ID"].tolist(),
+                    index=0,
+                )
+                row_sel = anom_top[anom_top["Rep_ID"] == selected_rep].iloc[0]
+                st.success(
+                    f"**{row_sel['Rep_ID']}** • Rank `#{int(row_sel['Severity_Rank'])}` • "
+                    f"Severity `{row_sel['Severity_Score']}` • {row_sel['Status']}\n\n"
+                    f"**Top Driving Features:** {row_sel['Top_Driving_Features']}"
+                )
+
+                show_cols = [
+                    c
+                    for c in [
+                        "Severity_Rank",
+                        "Rep_ID",
+                        "Cluster",
+                        "Status",
+                        "Severity_Score",
+                        "Cluster_Rel_Z_Norm",
+                        "Top_Driving_Features",
+                    ]
+                    if c in anom_top.columns
+                ]
+                st.dataframe(anom_top[show_cols].head(40), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.warning(
+        "Limitation & Clinical Note: Cluster groups, severity rankings, and anomaly flags reflect statistical "
+        "kinematic patterns and deviations in unlabeled motion features—they do not constitute an automated "
+        "medical, clinical, or ergonomic diagnosis."
+    )
+
+    csv_bytes = results_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download Full Unsupervised Results (CSV)",
+        data=csv_bytes,
+        file_name="intellirehabds_unsupervised_results_v2.csv",
+        mime="text/csv",
+    )
+
+
+if __name__ == "__main__":
+    main()
