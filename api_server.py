@@ -1,7 +1,10 @@
 from pathlib import Path
+import math
 import sys
 import threading
+import traceback
 from typing import Any, Dict, List
+
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
@@ -30,9 +33,48 @@ _LOCK = threading.Lock()
 _CACHE: Dict[tuple, Dict[str, Any]] = {}
 
 
-def _to_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
+def _normalize_scaler(scaler_type: str | None) -> str:
+    raw = str(scaler_type or "robust").strip().lower()
+    if "std" in raw or "standard" in raw:
+        return "standard"
+    return "robust"
+
+
+def _sanitize_json(obj: Any) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return {str(k): _sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_json(v) for v in obj]
+    if isinstance(obj, pd.Series):
+        return _sanitize_json(obj.reset_index().to_dict(orient="records"))
+    if isinstance(obj, pd.DataFrame):
+        df = obj.reset_index() if obj.index.name else obj
+        cleaned = df.replace([np.inf, -np.inf], np.nan).where(pd.notnull(df), None)
+        return _sanitize_json(cleaned.to_dict(orient="records"))
+    if isinstance(obj, (np.floating, float)):
+        val = float(obj)
+        return None if (math.isnan(val) or math.isinf(val)) else val
+    if isinstance(obj, (np.integer, np.int64)):
+        return int(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return _sanitize_json(obj.tolist())
+    try:
+        if pd.isna(obj):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return obj
+
+
+def _to_records(df: pd.DataFrame | None) -> List[Dict[str, Any]]:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return []
     cleaned = df.replace([np.inf, -np.inf], np.nan).where(pd.notnull(df), None)
-    return cleaned.to_dict(orient="records")
+    return _sanitize_json(cleaned.to_dict(orient="records"))
 
 
 def _get_bundle(
@@ -45,9 +87,10 @@ def _get_bundle(
     if not DEFAULT_CSV.exists():
         raise FileNotFoundError(f"Dataset not found at {DEFAULT_CSV}")
 
+    norm_scaler = _normalize_scaler(scaler_type)
     key = (
         str(DEFAULT_CSV),
-        scaler_type,
+        norm_scaler,
         bool(prune_collinear),
         round(float(contamination), 4),
         int(lof_neighbors),
@@ -60,7 +103,7 @@ def _get_bundle(
 
     bundle = run_full_ml_pipeline(
         phase2_csv=str(DEFAULT_CSV),
-        scaler_type=scaler_type,
+        scaler_type=norm_scaler,
         prune_collinear=prune_collinear,
         collinear_threshold=0.95,
         contamination=float(contamination),
@@ -69,7 +112,7 @@ def _get_bundle(
     )
     raw_prep = run_phase3_preprocessing(
         input_csv=str(DEFAULT_CSV),
-        scaler_type=scaler_type,
+        scaler_type=norm_scaler,
         prune_collinear=False,
         collinear_threshold=0.95,
     )
@@ -109,7 +152,7 @@ def dashboard(
             .rename(columns={"Anomaly_Status": "status", "count": "count"})
         )
 
-        return {
+        payload = {
             "total_records": int(len(res)),
             "active_features": b["prep"]["active_features"],
             "feature_count": int(len(b["prep"]["active_features"])),
@@ -122,6 +165,7 @@ def dashboard(
             "anomaly_distribution": _to_records(anomaly_dist),
             "top_anomalies": _to_records(b["anomalies_top"].head(8)),
         }
+        return _sanitize_json(payload)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -151,7 +195,7 @@ def dataset_overview(
             if c in stats.columns:
                 stats[c] = stats[c].round(5)
 
-        return {
+        payload = {
             "rows": int(len(X_sel)),
             "columns": int(len(X_sel.columns)),
             "feature_names": list(X_sel.columns),
@@ -164,6 +208,7 @@ def dataset_overview(
             "preview_rows": _to_records(merged.iloc[start:end]),
             "statistics": _to_records(stats),
         }
+        return _sanitize_json(payload)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -198,82 +243,17 @@ def movement_analysis(
                 row_obj[c_col] = float(corr.loc[r_col, c_col])
             corr_rows.append(row_obj)
 
-        return {
+        payload = {
             "features": cols,
             "selected_feature": target,
             "histogram": histogram,
             "correlation_rows": corr_rows,
             "cluster_medians": _to_records(b["profile_median"].reset_index()),
         }
+        return _sanitize_json(payload)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-
-@app.get("/api/clustering")
-def clustering_viz(
-    projection: str = Query("pca"),
-    color_by: str = Query("Cluster_KMeans"),
-    limit: int = Query(1000, ge=100, le=2577),
-    scaler_type: str = Query("robust"),
-):
-    try:
-        b = _get_bundle(scaler_type=scaler_type)
-        df = b["results_df"].copy()
-        if len(df) > limit:
-            step = max(1, len(df) // limit)
-            df = df.iloc[::step].head(limit)
-
-        proj = projection.lower()
-        x_col, y_col = (
-            ("UMAP_1", "UMAP_2")
-            if proj == "umap"
-            else (("TSNE_1", "TSNE_2") if proj == "tsne" else ("PCA_1", "PCA_2"))
-        )
-        allowed = {"Cluster_KMeans", "Cluster_GMM", "Cluster_DBSCAN", "Cluster_Hierarchical", "Anomaly_Status"}
-        c_col = color_by if color_by in allowed else "Cluster_KMeans"
-
-        pts = [
-            {
-                "rep_id": str(r["Rep_ID"]),
-                "x": float(r[x_col]),
-                "y": float(r[y_col]),
-                "group": str(r[c_col]),
-                "anomaly_status": str(r["Anomaly_Status"]),
-                "severity": float(r["Anomaly_Severity"]),
-                "top_driving_features": str(r["Top_Driving_Features"]),
-            }
-            for _, r in df.iterrows()
-            if np.isfinite(r[x_col]) and np.isfinite(r[y_col])
-        ]
-
-        return {
-            "projection": proj,
-            "x_label": x_col,
-            "y_label": y_col,
-            "color_by": c_col,
-            "points": pts,
-            "profiles": _to_records(b["profile_summary"]),
-            "tuned_params": b["tuned_params"],
-        }
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/api/evaluation")
-def model_evaluation(scaler_type: str = Query("robust")):
-    try:
-        b = _get_bundle(scaler_type=scaler_type)
-        rel = b["reliability"]
-        return {
-            "scorecard": _to_records(b["scorecard"]),
-            "scree": _to_records(b["scree"]),
-            "fidelity": _to_records(b["fidelity"]),
-            "seed_stability": _to_records(rel["seed_stability"]),
-            "feature_ablation": _to_records(rel["feature_ablation"]),
-            "anomalies_top": _to_records(b["anomalies_top"].head(20)),
-        }
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
 
 @app.get("/api/movement-3d")
 def movement_3d(
@@ -326,7 +306,7 @@ def movement_3d(
                     }
                 )
 
-        return {
+        payload = {
             "features": cols,
             "x_feature": xf,
             "y_feature": yf,
@@ -334,5 +314,108 @@ def movement_3d(
             "color_by": c_col,
             "points": points,
         }
+        return _sanitize_json(payload)
+    except Exception:
+        raise HTTPException(status_code=500, detail=traceback.format_exc())
+
+
+@app.get("/api/clustering")
+def clustering_viz(
+    projection: str = Query("pca"),
+    color_by: str = Query("Cluster_KMeans"),
+    limit: int = Query(1000, ge=100, le=2577),
+    scaler_type: str = Query("robust"),
+):
+    try:
+        b = _get_bundle(scaler_type=scaler_type)
+        df = b["results_df"].copy()
+        if len(df) > limit:
+            step = max(1, len(df) // limit)
+            df = df.iloc[::step].head(limit)
+
+        proj = projection.lower()
+        x_col, y_col = (
+            ("UMAP_1", "UMAP_2")
+            if proj == "umap"
+            else (("TSNE_1", "TSNE_2") if proj == "tsne" else ("PCA_1", "PCA_2"))
+        )
+        allowed = {"Cluster_KMeans", "Cluster_GMM", "Cluster_DBSCAN", "Cluster_Hierarchical", "Anomaly_Status"}
+        c_col = color_by if color_by in allowed else "Cluster_KMeans"
+
+        pts = [
+            {
+                "rep_id": str(r["Rep_ID"]),
+                "x": float(r[x_col]),
+                "y": float(r[y_col]),
+                "group": str(r[c_col]),
+                "anomaly_status": str(r["Anomaly_Status"]),
+                "severity": float(r["Anomaly_Severity"]) if pd.notna(r["Anomaly_Severity"]) else 0.0,
+                "top_driving_features": str(r["Top_Driving_Features"]),
+            }
+            for _, r in df.iterrows()
+            if np.isfinite(r[x_col]) and np.isfinite(r[y_col])
+        ]
+
+        payload = {
+            "projection": proj,
+            "x_label": x_col,
+            "y_label": y_col,
+            "color_by": c_col,
+            "points": pts,
+            "profiles": _to_records(b["profile_summary"]),
+            "tuned_params": b["tuned_params"],
+        }
+        return _sanitize_json(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+def _pick_first(mapping: Dict[str, Any], keys: List[str], fallback: Any = None) -> Any:
+    if isinstance(mapping, dict):
+        for k in keys:
+            if k in mapping and mapping[k] is not None:
+                return mapping[k]
+    return fallback
+
+
+@app.get("/api/evaluation")
+def model_evaluation(scaler_type: str = Query("robust")):
+    try:
+        b = _get_bundle(scaler_type=scaler_type)
+        rel = b.get("reliability") if isinstance(b.get("reliability"), dict) else {}
+
+        def _records_any(obj: Any) -> List[Dict[str, Any]]:
+            if obj is None:
+                return []
+            if isinstance(obj, pd.Series):
+                return _to_records(obj.reset_index())
+            if isinstance(obj, pd.DataFrame):
+                return _to_records(obj.reset_index() if obj.index.name else obj)
+            if isinstance(obj, (list, tuple)):
+                return _sanitize_json(list(obj))
+            return []
+
+        seed_stab = _pick_first(
+            rel,
+            ["seed_stability", "seed_stability_df", "stability"],
+            _pick_first(b, ["seed_stability"]),
+        )
+        feat_abl = _pick_first(
+            rel,
+            ["feature_ablation", "feature_ablation_df", "ablation"],
+            _pick_first(b, ["feature_ablation"]),
+        )
+        anoms = b.get("anomalies_top")
+        if hasattr(anoms, "head"):
+            anoms = anoms.head(20)
+
+        payload = {
+            "scorecard": _records_any(b.get("scorecard")),
+            "scree": _records_any(b.get("scree")),
+            "fidelity": _records_any(b.get("fidelity")),
+            "seed_stability": _records_any(seed_stab),
+            "feature_ablation": _records_any(feat_abl),
+            "anomalies_top": _records_any(anoms),
+        }
+        return _sanitize_json(payload)
     except Exception:
         raise HTTPException(status_code=500, detail=traceback.format_exc())
