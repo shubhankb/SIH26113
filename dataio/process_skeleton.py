@@ -7,10 +7,8 @@ import matplotlib.mlab as mlab
 import matplotlib.pyplot as plt
 
 class Gesture:
-    """ Gesture class represents and manipulates data about a single repetition """
 
     def __init__(self):
-        """ Create a new point at the origin """
         self.patient_id = ""
         self.date = ""
         self.gesture_type = 0
@@ -37,7 +35,6 @@ def split_file_name(file_name):
 
 
 def data_stats(data, data_info):
-    # What is the average length of the correct sequences?
     number_correct = 0
     avg_correct = 0
     number_incorrect = 0

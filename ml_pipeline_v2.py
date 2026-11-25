@@ -1,4 +1,9 @@
+import numpy as np
 import pandas as pd
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.preprocessing import RobustScaler, StandardScaler
+
 from phase3_preprocessing import run_phase3_preprocessing
 from phase5_tuning import run_phase5_optimization
 from phase6_evaluation import run_phase6_evaluation
@@ -8,7 +13,97 @@ from phase9_anomalies import run_phase9_anomaly_detection
 from phase10_reliability import run_phase10_reliability
 from phase11_insights import generate_ml_insights
 
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import QuantileTransformer
 
+
+def fit_balanced_kmeans(
+    X_raw_df: pd.DataFrame,
+    scaler=None,
+    k_candidates=(3, 4, 5),
+    min_cluster_fraction: float = 0.03,
+    max_cluster_fraction: float = 0.70,
+    use_pca_dims: int = 4,
+    random_state: int = 42,
+):
+    X_work = X_raw_df.copy()
+
+    skewed_cols = [
+        c
+        for c in [
+            "spatial_rom_3d",
+            "mean_speed_3d",
+            "p95_speed_3d",
+            "mean_jerk_3d",
+            "norm_variability",
+        ]
+        if c in X_work.columns
+    ]
+    for col in skewed_cols:
+        s = pd.to_numeric(X_work[col], errors="coerce").clip(lower=0.0)
+        X_work[col] = np.log1p(s)
+
+    qt = QuantileTransformer(
+        n_quantiles=min(500, len(X_work)),
+        output_distribution="normal",
+        random_state=random_state,
+    )
+    X_norm = qt.fit_transform(X_work)
+
+    n_comps = min(use_pca_dims, X_norm.shape[1])
+    X_proj = PCA(n_components=n_comps, random_state=random_state).fit_transform(X_norm)
+
+    n_total = len(X_work)
+    min_req = max(15, int(n_total * min_cluster_fraction))
+    max_allowed = int(n_total * max_cluster_fraction)
+
+    best_k = k_candidates[0]
+    best_score = -1.0
+    best_labels = None
+    best_model = None
+
+    # Pass 1: Strict balance (min_req <= count <= max_allowed for every cluster)
+    for k in k_candidates:
+        model = KMeans(n_clusters=k, n_init=25, random_state=random_state)
+        labels = model.fit_predict(X_proj)
+        counts = np.bincount(labels, minlength=k)
+        if np.min(counts) < min_req or np.max(counts) > max_allowed:
+            continue
+        score = silhouette_score(X_proj, labels)
+        if score > best_score:
+            best_score = score
+            best_k = k
+            best_labels = labels
+            best_model = model
+
+    # Pass 2: Fallback only on min_req if no k satisfies max_allowed
+    if best_labels is None:
+        for k in k_candidates:
+            model = KMeans(n_clusters=k, n_init=25, random_state=random_state)
+            labels = model.fit_predict(X_proj)
+            counts = np.bincount(labels, minlength=k)
+            if np.min(counts) < min_req:
+                continue
+            score = silhouette_score(X_proj, labels)
+            if score > best_score:
+                best_score = score
+                best_k = k
+                best_labels = labels
+                best_model = model
+
+    if best_labels is None:
+        best_model = KMeans(n_clusters=k_candidates[0], n_init=25, random_state=random_state)
+        best_labels = best_model.fit_predict(X_proj)
+        best_k = k_candidates[0]
+        best_score = float(silhouette_score(X_proj, best_labels))
+
+    return {
+        "k": best_k,
+        "labels": best_labels,
+        "silhouette": float(best_score),
+        "model": best_model,
+        "X_scaled": X_proj,
+    }
 def run_full_ml_pipeline(
     phase2_csv: str = "phase2_kinematic_features.csv",
     scaler_type: str = "robust",
@@ -37,11 +132,31 @@ def run_full_ml_pipeline(
         X_arr, tuned_params=tuned_params, random_state=random_state
     )
 
+    # Balanced K-Means on selected features (log1p + scaling + min cluster size filter)
+    active_scaler = prep.get("scaler")
+    if active_scaler is None:
+        active_scaler = (
+            StandardScaler()
+            if str(scaler_type).strip().lower() in {"std", "standard", "standardscaler"}
+            else RobustScaler()
+        )
+
+    balanced_km = fit_balanced_kmeans(
+        X_raw_df=prep["X_selected"],
+        scaler=active_scaler,
+        k_candidates=(3, 4, 5),
+        min_cluster_fraction=0.02,
+        random_state=random_state,
+    )
+    km_lbl = balanced_km["labels"]
+    fitted_labels["kmeans"] = km_lbl
+    if isinstance(tuned_params, dict) and isinstance(tuned_params.get("kmeans"), dict):
+        tuned_params["kmeans"]["n_clusters"] = int(balanced_km["k"])
+
     # Phase 7: Dimensionality reduction (PCA, t-SNE, UMAP) + distance fidelity
     dim_res = run_phase7_dim_reduction(X_arr, random_state=random_state)
 
-    # Phase 8: Cluster profiling (K-Means & GMM profiles)
-    km_lbl = fitted_labels["kmeans"]
+    # Phase 8: Cluster profiling (K-Means balanced labels)
     prof_summary, prof_mean, prof_med, prof_std = run_phase8_profiling(prep["X_selected"], km_lbl)
 
     # Phase 9: Enhanced anomaly detection (IF + LOF + severity + top driving features)
@@ -56,7 +171,7 @@ def run_full_ml_pipeline(
     )
 
     # Phase 10: Stability & reliability experiments
-    km_k = int(tuned_params["kmeans"]["n_clusters"])
+    km_k = int(balanced_km["k"])
     reliability = run_phase10_reliability(X_scaled_df, n_clusters=km_k, random_state=random_state)
 
     # Phase 11: Automated data-backed insights
